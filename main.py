@@ -1,14 +1,17 @@
 import html
-import json
 import os
 import subprocess
-import sys
-import threading
 from collections import OrderedDict
-from urllib.parse import urljoin
-from urllib.parse import urlparse
-from urllib.request import pathname2url
-from urllib.request import url2pathname
+from .core.logging import debug, server_log
+from .core.diagnostics import handle_diagnostics, remove_diagnostics, get_line_diagnostics
+from .core.events import Events
+from .core.settings import ClientConfig, load_settings, show_status_messages, show_view_status,  show_diagnostics_in_view_status, complete_all_chars, settings
+from .core.url import filename_to_uri, uri_to_filename
+from .core.workspace import get_project_path, is_in_workspace
+from .Commands.panels import *
+from .rpc.protocol import DiagnosticSeverity, Diagnostic, Point, Range, Request, Notification, SymbolKind, CompletionItemKind
+from .rpc.client import Client
+
 try:
     from typing import Any, List, Dict, Tuple, Callable, Optional
     assert Any and List and Dict and Tuple and Callable and Optional
@@ -17,7 +20,6 @@ except ImportError:
 
 import sublime_plugin
 import sublime
-
 import mdpopups
 
 
@@ -25,64 +27,8 @@ PLUGIN_NAME = 'LSP'
 SUBLIME_WORD_MASK = 515
 NO_HOVER_SCOPES = 'comment, constant, keyword, storage, string'
 NO_COMPLETION_SCOPES = 'comment, string'
-show_status_messages = True
-show_view_status = True
-auto_show_diagnostics_panel = True
-show_diagnostics_phantoms = False
-show_diagnostics_in_view_status = True
-only_show_lsp_completions = False
-diagnostics_highlight_style = "underline"
-complete_all_chars = False
-log_debug = True
-log_server = True
-log_stderr = False
 
-global_client_configs = []  # type: List[ClientConfig]
 window_client_configs = dict()  # type: Dict[int, List[ClientConfig]]
-
-
-class DiagnosticSeverity(object):
-    Error = 1
-    Warning = 2
-    Information = 3
-    Hint = 4
-
-
-diagnostic_severity_names = {
-    DiagnosticSeverity.Error: "error",
-    DiagnosticSeverity.Warning: "warning",
-    DiagnosticSeverity.Information: "info",
-    DiagnosticSeverity.Hint: "hint"
-}
-
-diagnostic_severity_scopes = {
-    DiagnosticSeverity.Error: 'markup.deleted.lsp sublimelinter.mark.error markup.error.lsp',
-    DiagnosticSeverity.Warning: 'markup.changed.lsp sublimelinter.mark.warning markup.warning.lsp',
-    DiagnosticSeverity.Information: 'markup.inserted.lsp sublimelinter.gutter-mark markup.info.lsp',
-    DiagnosticSeverity.Hint: 'markup.inserted.lsp sublimelinter.gutter-mark markup.info.suggestion.lsp'
-}
-
-
-class SymbolKind(object):
-    File = 1
-    Module = 2
-    Namespace = 3
-    Package = 4
-    Class = 5
-    Method = 6
-    Property = 7
-    Field = 8
-    Constructor = 9
-    Enum = 10
-    Interface = 11
-    Function = 12
-    Variable = 13
-    Constant = 14
-    String = 15
-    Number = 16
-    Boolean = 17
-    Array = 18
-
 
 symbol_kind_names = {
     SymbolKind.File: "file",
@@ -98,508 +44,7 @@ symbol_kind_names = {
 }
 
 
-class CompletionItemKind(object):
-    Text = 1
-    Method = 2
-    Function = 3
-    Constructor = 4
-    Field = 5
-    Variable = 6
-    Class = 7
-    Interface = 8
-    Module = 9
-    Property = 10
-    Unit = 11
-    Value = 12
-    Enum = 13
-    Keyword = 14
-    Snippet = 15
-    Color = 16
-    File = 17
-    Reference = 18
-
-
 completion_item_kind_names = {v: k for k, v in CompletionItemKind.__dict__.items()}
-
-
-class Request:
-    def __init__(self, method, params):
-        self.method = method
-        self.params = params
-        self.jsonrpc = "2.0"
-
-    @classmethod
-    def initialize(cls, params):
-        return Request("initialize", params)
-
-    @classmethod
-    def hover(cls, params):
-        return Request("textDocument/hover", params)
-
-    @classmethod
-    def complete(cls, params):
-        return Request("textDocument/completion", params)
-
-    @classmethod
-    def signatureHelp(cls, params):
-        return Request("textDocument/signatureHelp", params)
-
-    @classmethod
-    def references(cls, params):
-        return Request("textDocument/references", params)
-
-    @classmethod
-    def definition(cls, params):
-        return Request("textDocument/definition", params)
-
-    @classmethod
-    def rename(cls, params):
-        return Request("textDocument/rename", params)
-
-    @classmethod
-    def codeAction(cls, params):
-        return Request("textDocument/codeAction", params)
-
-    @classmethod
-    def executeCommand(cls, params):
-        return Request("workspace/executeCommand", params)
-
-    @classmethod
-    def formatting(cls, params):
-        return Request("textDocument/formatting", params)
-
-    @classmethod
-    def documentSymbols(cls, params):
-        return Request("textDocument/documentSymbol", params)
-
-    def __repr__(self):
-        return self.method + " " + str(self.params)
-
-    def to_payload(self, id):
-        r = OrderedDict()  # type: OrderedDict[str, Any]
-        r["jsonrpc"] = "2.0"
-        r["id"] = id
-        r["method"] = self.method
-        r["params"] = self.params
-        return r
-
-
-class Notification:
-    def __init__(self, method, params):
-        self.method = method
-        self.params = params
-        self.jsonrpc = "2.0"
-
-    @classmethod
-    def initialized(cls):
-        return Notification("initialized", None)
-
-    @classmethod
-    def didOpen(cls, params):
-        return Notification("textDocument/didOpen", params)
-
-    @classmethod
-    def didChange(cls, params):
-        return Notification("textDocument/didChange", params)
-
-    @classmethod
-    def didSave(cls, params):
-        return Notification("textDocument/didSave", params)
-
-    @classmethod
-    def didClose(cls, params):
-        return Notification("textDocument/didClose", params)
-
-    @classmethod
-    def didChangeConfiguration(cls, params):
-        return Notification("workspace/didChangeConfiguration", params)
-
-    @classmethod
-    def exit(cls):
-        return Notification("exit", None)
-
-    def __repr__(self):
-        return self.method + " " + str(self.params)
-
-    def to_payload(self):
-        r = OrderedDict()  # type: OrderedDict[str, Any]
-        r["jsonrpc"] = "2.0"
-        r["method"] = self.method
-        r["params"] = self.params
-        return r
-
-
-class Point(object):
-    def __init__(self, row: int, col: int) -> None:
-        self.row = int(row)
-        self.col = int(col)
-
-    def __repr__(self):
-        return "{}:{}".format(self.row, self.col)
-
-    @classmethod
-    def from_lsp(cls, point: dict) -> 'Point':
-        return Point(point['line'], point['character'])
-
-    def to_lsp(self) -> dict:
-        r = OrderedDict()  # type: OrderedDict[str, Any]
-        r['line'] = self.row
-        r['character'] = self.col
-        return r
-
-    @classmethod
-    def from_text_point(self, view: sublime.View, point: int) -> 'Point':
-        return Point(*view.rowcol(point))
-
-    def to_text_point(self, view) -> int:
-        return view.text_point(self.row, self.col)
-
-
-class Range(object):
-    def __init__(self, start: Point, end: Point) -> None:
-        self.start = start
-        self.end = end
-
-    def __repr__(self):
-        return "({} {})".format(self.start, self.end)
-
-    @classmethod
-    def from_lsp(cls, range: dict) -> 'Range':
-        return Range(Point.from_lsp(range['start']), Point.from_lsp(range['end']))
-
-    def to_lsp(self) -> dict:
-        r = OrderedDict()  # type: OrderedDict[str, Any]
-        r['start'] = self.start.to_lsp()
-        r['end'] = self.end.to_lsp()
-        return r
-
-    @classmethod
-    def from_region(self, view: sublime.View, region: sublime.Region) -> 'Range':
-        return Range(
-            Point.from_text_point(view, region.begin()),
-            Point.from_text_point(view, region.end())
-        )
-
-    def to_region(self, view: sublime.View) -> sublime.Region:
-        return sublime.Region(self.start.to_text_point(view), self.end.to_text_point(view))
-
-
-class Diagnostic(object):
-    def __init__(self, message, range, severity, source, lsp_diagnostic):
-        self.message = message
-        self.range = range
-        self.severity = severity
-        self.source = source
-        self._lsp_diagnostic = lsp_diagnostic
-
-    @classmethod
-    def from_lsp(cls, lsp_diagnostic):
-        return Diagnostic(
-            # crucial keys
-            lsp_diagnostic['message'],
-            Range.from_lsp(lsp_diagnostic['range']),
-            # optional keys
-            lsp_diagnostic.get('severity', DiagnosticSeverity.Error),
-            lsp_diagnostic.get('source'),
-            lsp_diagnostic
-        )
-
-    def to_lsp(self):
-        return self._lsp_diagnostic
-
-
-def read_client_config(name, client_config):
-    return ClientConfig(
-        name,
-        client_config.get("command", []),
-        client_config.get("scopes", []),
-        client_config.get("syntaxes", []),
-        client_config.get("languageId", ""),
-        client_config.get("enabled", True),
-        client_config.get("initializationOptions", dict())
-    )
-
-
-def load_settings():
-    settings_obj = sublime.load_settings("LSP.sublime-settings")
-    update_settings(settings_obj)
-    settings_obj.add_on_change("_on_new_settings", lambda: update_settings(settings_obj))
-
-
-def read_bool_setting(settings_obj: sublime.Settings, key: str, default: bool) -> bool:
-    val = settings_obj.get(key)
-    if isinstance(val, bool):
-        return val
-    else:
-        return default
-
-
-def read_str_setting(settings_obj: sublime.Settings, key: str, default: str) -> str:
-    val = settings_obj.get(key)
-    if isinstance(val, str):
-        return val
-    else:
-        return default
-
-
-def update_settings(settings_obj: sublime.Settings):
-    global show_status_messages
-    global show_view_status
-    global auto_show_diagnostics_panel
-    global show_diagnostics_phantoms
-    global show_diagnostics_in_view_status
-    global only_show_lsp_completions
-    global diagnostics_highlight_style
-    global complete_all_chars
-    global log_debug
-    global log_server
-    global log_stderr
-    global global_client_configs
-
-    global_client_configs = []
-    client_configs = settings_obj.get("clients", {})
-    if isinstance(client_configs, dict):
-        for client_name, client_config in client_configs.items():
-            config = read_client_config(client_name, client_config)
-            if config:
-                debug("Config added:", client_name, '(enabled)' if config.enabled else '(disabled)')
-                global_client_configs.append(config)
-    else:
-        raise ValueError("client_configs")
-
-    show_status_messages = read_bool_setting(settings_obj, "show_status_messages", True)
-    show_view_status = read_bool_setting(settings_obj, "show_view_status", True)
-    auto_show_diagnostics_panel = read_bool_setting(settings_obj, "auto_show_diagnostics_panel", True)
-    show_diagnostics_phantoms = read_bool_setting(settings_obj, "show_diagnostics_phantoms", False)
-    show_diagnostics_in_view_status = read_bool_setting(settings_obj, "show_diagnostics_in_view_status", True)
-    diagnostics_highlight_style = read_str_setting(settings_obj, "diagnostics_highlight_style", "underline")
-    only_show_lsp_completions = read_bool_setting(settings_obj, "only_show_lsp_completions", False)
-    complete_all_chars = read_bool_setting(settings_obj, "complete_all_chars", True)
-    log_debug = read_bool_setting(settings_obj, "log_debug", False)
-    log_server = read_bool_setting(settings_obj, "log_server", True)
-    log_stderr = read_bool_setting(settings_obj, "log_stderr", False)
-
-
-class ClientConfig(object):
-    def __init__(self, name, binary_args, scopes, syntaxes, languageId,
-                 enabled=True, init_options=dict(), settings=dict()):
-        self.name = name
-        self.binary_args = binary_args
-        self.scopes = scopes
-        self.syntaxes = syntaxes
-        self.languageId = languageId
-        self.enabled = enabled
-        self.init_options = init_options
-        self.settings = settings
-
-
-def format_request(payload: 'Dict[str, Any]'):
-    """Converts the request into json and adds the Content-Length header"""
-    content = json.dumps(payload, sort_keys=False)
-    content_length = len(content)
-    result = "Content-Length: {}\r\n\r\n{}".format(content_length, content)
-    return result
-
-
-class Client(object):
-    def __init__(self, process, project_path):
-        self.process = process
-        self.stdout_thread = threading.Thread(target=self.read_stdout)
-        self.stdout_thread.start()
-        self.stderr_thread = threading.Thread(target=self.read_stderr)
-        self.stderr_thread.start()
-        self.project_path = project_path
-        self.request_id = 0
-        self.handlers = {}  # type: Dict[int, Callable]
-        self.capabilities = {}  # type: Dict[str, Any]
-
-    def set_capabilities(self, capabilities):
-        self.capabilities = capabilities
-
-    def get_project_path(self):
-        return self.project_path
-
-    def has_capability(self, capability):
-        return capability in self.capabilities
-
-    def get_capability(self, capability):
-        return self.capabilities.get(capability)
-
-    def send_request(self, request: Request, handler: 'Callable'):
-        self.request_id += 1
-        debug('request {}: {} '.format(self.request_id, request.method))
-        if handler is not None:
-            self.handlers[self.request_id] = handler
-        self.send_payload(request.to_payload(self.request_id))
-
-    def send_notification(self, notification: Notification):
-        debug('notify: ' + notification.method)
-        self.send_payload(notification.to_payload())
-
-    def kill(self):
-        self.process.kill()
-
-    def send_payload(self, payload):
-        try:
-            message = format_request(payload)
-            self.process.stdin.write(bytes(message, 'UTF-8'))
-            self.process.stdin.flush()
-        except BrokenPipeError as e:
-            printf("client unexpectedly died:", e)
-
-    def read_stdout(self):
-        """
-        Reads JSON responses from process and dispatch them to response_handler
-        """
-        ContentLengthHeader = b"Content-Length: "
-
-        while self.process.poll() is None:
-            try:
-
-                in_headers = True
-                content_length = 0
-                while in_headers:
-                    header = self.process.stdout.readline().strip()
-                    if (len(header) == 0):
-                        in_headers = False
-
-                    if header.startswith(ContentLengthHeader):
-                        content_length = int(header[len(ContentLengthHeader):])
-
-                if (content_length > 0):
-                    content = self.process.stdout.read(content_length).decode(
-                        "UTF-8")
-
-                    payload = None
-                    try:
-                        payload = json.loads(content)
-                        limit = min(len(content), 200)
-                        if payload.get("method") != "window/logMessage":
-                            debug("got json: ", content[0:limit])
-                    except IOError:
-                        printf("Got a non-JSON payload: ", content)
-                        continue
-
-                    try:
-                        if "error" in payload:
-                            error = payload['error']
-                            debug("got error: ", error)
-                            sublime.status_message(error.get('message'))
-                        elif "method" in payload:
-                            if "id" in payload:
-                                self.request_handler(payload)
-                            else:
-                                self.notification_handler(payload)
-                        elif "id" in payload:
-                            self.response_handler(payload)
-                        else:
-                            debug("Unknown payload type: ", payload)
-                    except Exception as err:
-                        printf("Error handling server content:", err)
-
-            except IOError:
-                printf("LSP stdout process ending due to exception: ",
-                       sys.exc_info())
-                self.process.terminate()
-                self.process = None
-                return
-
-        debug("LSP stdout process ended.")
-
-    def read_stderr(self):
-        """
-        Reads any errors from the LSP process.
-        """
-        while self.process.poll() is None:
-            try:
-                content = self.process.stderr.readline()
-                if log_stderr and len(content) > 0:
-                    printf("(stderr): ", content.strip())
-            except IOError:
-                printf("LSP stderr process ending due to exception: ",
-                       sys.exc_info())
-                return
-
-        debug("LSP stderr process ended.")
-
-    def response_handler(self, response):
-        try:
-            handler_id = int(response.get("id"))  # dotty sends strings back :(
-            result = response.get('result', None)
-            if (self.handlers[handler_id]):
-                self.handlers[handler_id](result)
-            else:
-                debug("No handler found for id" + response.get("id"))
-        except Exception as e:
-            debug("error handling response", handler_id)
-            raise
-
-    def request_handler(self, request):
-        method = request.get("method")
-        if method == "workspace/applyEdit":
-            apply_workspace_edit(sublime.active_window(),
-                                 request.get("params"))
-        else:
-            debug("Unhandled request", method)
-
-    def notification_handler(self, response):
-        method = response.get("method")
-        if method == "textDocument/publishDiagnostics":
-            Events.publish("document.diagnostics", response.get("params"))
-        elif method == "window/showMessage":
-            sublime.active_window().message_dialog(
-                response.get("params").get("message"))
-        elif method == "window/logMessage" and log_server:
-            server_log(self.process.args[0],
-                       response.get("params").get("message"))
-        else:
-            debug("Unhandled notification:", method)
-
-
-def debug(*args):
-    """Print args to the console if the "debug" setting is True."""
-    if log_debug:
-        printf(*args)
-
-
-def server_log(binary, *args):
-    printf(*args, prefix=binary)
-
-
-def printf(*args, prefix=PLUGIN_NAME):
-    """Print args to the console, prefixed by the plugin name."""
-    print(prefix + ":", *args)
-
-
-def get_project_path(window: sublime.Window) -> 'Optional[str]':
-    """
-    Returns the common root of all open folders in the window
-    """
-    if len(window.folders()):
-        folder_paths = window.folders()
-        return folder_paths[0]
-    else:
-        debug("Couldn't determine project directory")
-        return None
-
-
-def get_common_parent(paths: 'List[str]') -> str:
-    """
-    Get the common parent directory of multiple paths.
-
-    Python 3.5+ includes os.path.commonpath which does this, however Sublime
-    currently embeds Python 3.3.
-    """
-    return os.path.commonprefix([path + '/' for path in paths]).rstrip('/')
-
-
-def is_in_workspace(window: sublime.Window, file_path: str) -> bool:
-    workspace_path = get_project_path(window)
-    if workspace_path is None:
-        return False
-
-    common_dir = get_common_parent([workspace_path, file_path])
-    return workspace_path == common_dir
 
 
 def plugin_loaded():
@@ -667,7 +112,7 @@ def get_scope_client_config(view: 'sublime.View', configs: 'List[ClientConfig]')
 
 
 def get_global_client_config(view: sublime.View) -> 'Optional[ClientConfig]':
-    return get_scope_client_config(view, global_client_configs)
+    return get_scope_client_config(view, settings.global_client_configs)
 
 
 def get_project_config(view: sublime.View) -> dict:
@@ -723,7 +168,7 @@ def config_for_scope(view: sublime.View) -> 'Optional[ClientConfig]':
 
 
 def is_supported_syntax(syntax: str) -> bool:
-    for config in global_client_configs:
+    for config in settings.global_client_configs:
         if syntax in config.syntaxes:
             return True
     return False
@@ -744,14 +189,6 @@ TextDocumentSyncKindIncremental = 2
 didopen_after_initialize = list()
 unsubscribe_initialize_on_load = None
 unsubscribe_initialize_on_activated = None
-
-
-def filename_to_uri(path: str) -> str:
-    return urljoin('file:', pathname2url(path))
-
-
-def uri_to_filename(uri: str) -> str:
-    return url2pathname(urlparse(uri).path)
 
 
 def client_for_view(view: sublime.View) -> 'Optional[Client]':
@@ -1033,18 +470,6 @@ def create_phantom(view: sublime.View, diagnostic: Diagnostic) -> sublime.Phanto
     )
 
 
-def format_severity(severity: int) -> str:
-    return diagnostic_severity_names.get(severity, "???")
-
-
-def format_diagnostic(diagnostic: Diagnostic) -> str:
-    location = "{:>8}:{:<4}".format(
-        diagnostic.range.start.row + 1, diagnostic.range.start.col + 1)
-    message = diagnostic.message.replace("\n", " ").replace("\r", "")
-    return " {}\t{:<12}\t{:<10}\t{}".format(
-        location, diagnostic.source, format_severity(diagnostic.severity), message)
-
-
 class LspSymbolRenameCommand(sublime_plugin.TextCommand):
     def is_enabled(self, event=None):
         # TODO: check what kind of scope we're in.
@@ -1209,43 +634,6 @@ def is_at_word(view: sublime.View, event) -> bool:
         return False
 
 
-OUTPUT_PANEL_SETTINGS = {
-    "auto_indent": False,
-    "draw_indent_guides": False,
-    "draw_white_space": "None",
-    "gutter": False,
-    'is_widget': True,
-    "line_numbers": False,
-    "margin": 3,
-    "match_brackets": False,
-    "scroll_past_end": False,
-    "tab_size": 4,
-    "translate_tabs_to_spaces": False,
-    "word_wrap": False
-}
-
-
-def create_output_panel(window: sublime.Window, name: str) -> sublime.View:
-    panel = window.create_output_panel(name)
-    settings = panel.settings()
-    for key, value in OUTPUT_PANEL_SETTINGS.items():
-        settings.set(key, value)
-    return panel
-
-
-def ensure_references_panel(window: sublime.Window):
-    return window.find_output_panel("references") or create_references_panel(window)
-
-
-def create_references_panel(window: sublime.Window):
-    panel = create_output_panel(window, "references")
-    panel.settings().set("result_file_regex",
-                         r"^\s+\S\s+(\S.+)\s+(\d+):?(\d+)$")
-    panel.assign_syntax("Packages/" + PLUGIN_NAME +
-                        "/Syntaxes/References.sublime-syntax")
-    return panel
-
-
 class LspSymbolReferencesCommand(sublime_plugin.TextCommand):
     def is_enabled(self, event=None):
         if is_supported_view(self.view):
@@ -1305,198 +693,6 @@ def format_reference(reference, base_dir):
     file_path = uri_to_filename(reference.get("uri"))
     relative_file_path = os.path.relpath(file_path, base_dir)
     return " ◌ {} {}:{}".format(relative_file_path, start.row + 1, start.col + 1)
-
-
-class LspClearPanelCommand(sublime_plugin.TextCommand):
-    """
-    A clear_panel command to clear the error panel.
-    """
-
-    def run(self, edit):
-        self.view.erase(edit, sublime.Region(0, self.view.size()))
-
-
-class LspUpdatePanelCommand(sublime_plugin.TextCommand):
-    """
-    A update_panel command to update the error panel with new text.
-    """
-
-    def run(self, edit, characters):
-        self.view.replace(edit, sublime.Region(0, self.view.size()), characters)
-
-        # Move cursor to the end
-        selection = self.view.sel()
-        selection.clear()
-        selection.add(sublime.Region(self.view.size(), self.view.size()))
-
-
-UNDERLINE_FLAGS = (sublime.DRAW_SQUIGGLY_UNDERLINE
-                   | sublime.DRAW_NO_OUTLINE
-                   | sublime.DRAW_NO_FILL
-                   | sublime.DRAW_EMPTY_AS_OVERWRITE)
-
-BOX_FLAGS = sublime.DRAW_NO_FILL | sublime.DRAW_EMPTY_AS_OVERWRITE
-
-window_file_diagnostics = dict(
-)  # type: Dict[int, Dict[str, Dict[str, List[Diagnostic]]]]
-
-
-def update_file_diagnostics(window: sublime.Window, file_path: str, source: str,
-                            diagnostics: 'List[Diagnostic]'):
-    if diagnostics:
-        window_file_diagnostics.setdefault(window.id(), dict()).setdefault(
-            file_path, dict())[source] = diagnostics
-    else:
-        if window.id() in window_file_diagnostics:
-            file_diagnostics = window_file_diagnostics[window.id()]
-            if file_path in file_diagnostics:
-                if source in file_diagnostics[file_path]:
-                    del file_diagnostics[file_path][source]
-                if not file_diagnostics[file_path]:
-                    del file_diagnostics[file_path]
-
-
-phantom_sets_by_buffer = {}  # type: Dict[int, sublime.PhantomSet]
-
-
-def update_diagnostics_phantoms(view: sublime.View, diagnostics: 'List[Diagnostic]'):
-    global phantom_sets_by_buffer
-
-    buffer_id = view.buffer_id()
-    if not show_diagnostics_phantoms or view.is_dirty():
-        phantoms = None
-    else:
-        phantoms = list(
-            create_phantom(view, diagnostic) for diagnostic in diagnostics)
-    if phantoms:
-        phantom_set = phantom_sets_by_buffer.get(buffer_id)
-        if not phantom_set:
-            phantom_set = sublime.PhantomSet(view, "lsp_diagnostics")
-            phantom_sets_by_buffer[buffer_id] = phantom_set
-        phantom_set.update(phantoms)
-    else:
-        phantom_sets_by_buffer.pop(buffer_id, None)
-
-
-def update_diagnostics_regions(view: sublime.View, diagnostics: 'List[Diagnostic]', severity: int):
-    region_name = "lsp_" + format_severity(severity)
-    if show_diagnostics_phantoms and not view.is_dirty():
-        regions = None
-    else:
-        regions = list(diagnostic.range.to_region(view) for diagnostic in diagnostics
-                       if diagnostic.severity == severity)
-    if regions:
-        scope_name = diagnostic_severity_scopes[severity]
-        view.add_regions(
-            region_name, regions, scope_name, "dot",
-            UNDERLINE_FLAGS if diagnostics_highlight_style == "underline" else BOX_FLAGS)
-    else:
-        view.erase_regions(region_name)
-
-
-def update_diagnostics_in_view(view: sublime.View, diagnostics: 'List[Diagnostic]'):
-    if view and view.is_valid():
-        update_diagnostics_phantoms(view, diagnostics)
-        for severity in range(DiagnosticSeverity.Error, DiagnosticSeverity.Information):
-            update_diagnostics_regions(view, diagnostics, severity)
-
-
-def remove_diagnostics(view: sublime.View):
-    """Removes diagnostics for a file if no views exist for it
-    """
-    window = sublime.active_window()
-
-    file_path = view.file_name()
-    if not window.find_open_file(view.file_name()):
-        update_file_diagnostics(window, file_path, 'lsp', [])
-        update_diagnostics_panel(window)
-    else:
-        debug('file still open?')
-
-
-def handle_diagnostics(update: 'Any'):
-    file_path = uri_to_filename(update.get('uri'))
-    window = sublime.active_window()
-
-    if not is_in_workspace(window, file_path):
-        debug("Skipping diagnostics for file", file_path,
-              " it is not in the workspace")
-        return
-
-    diagnostics = list(
-        Diagnostic.from_lsp(item) for item in update.get('diagnostics', []))
-
-    view = window.find_open_file(file_path)
-
-    # diagnostics = update.get('diagnostics')
-
-    update_diagnostics_in_view(view, diagnostics)
-
-    # update panel if available
-
-    origin = 'lsp'  # TODO: use actual client name to be able to update diagnostics per client
-
-    update_file_diagnostics(window, file_path, origin, diagnostics)
-    update_diagnostics_panel(window)
-
-
-class LspShowDiagnosticsPanelCommand(sublime_plugin.WindowCommand):
-    def run(self):
-        ensure_diagnostics_panel(self.window)
-        self.window.run_command("show_panel", {"panel": "output.diagnostics"})
-
-
-def create_diagnostics_panel(window):
-    panel = create_output_panel(window, "diagnostics")
-    panel.settings().set("result_file_regex", r"^\s*\S\s+(\S.*):$")
-    panel.settings().set("result_line_regex", r"^\s+([0-9]+):?([0-9]+).*$")
-    panel.assign_syntax("Packages/" + PLUGIN_NAME +
-                        "/Syntaxes/Diagnostics.sublime-syntax")
-    return panel
-
-
-def ensure_diagnostics_panel(window):
-    return window.find_output_panel("diagnostics") or create_diagnostics_panel(window)
-
-
-def update_diagnostics_panel(window):
-    assert window, "missing window!"
-    base_dir = get_project_path(window)
-
-    panel = ensure_diagnostics_panel(window)
-    assert panel, "must have a panel now!"
-
-    if window.id() in window_file_diagnostics:
-        active_panel = window.active_panel()
-        is_active_panel = (active_panel == "output.diagnostics")
-        panel.settings().set("result_base_dir", base_dir)
-        panel.set_read_only(False)
-        file_diagnostics = window_file_diagnostics[window.id()]
-        if file_diagnostics:
-            to_render = []
-            for file_path, source_diagnostics in file_diagnostics.items():
-                relative_file_path = os.path.relpath(file_path, base_dir) if base_dir else file_path
-                if source_diagnostics:
-                    to_render.append(format_diagnostics(relative_file_path, source_diagnostics))
-            panel.run_command("lsp_update_panel", {"characters": "\n".join(to_render)})
-            if auto_show_diagnostics_panel and not active_panel:
-                window.run_command("show_panel",
-                                   {"panel": "output.diagnostics"})
-        else:
-            panel.run_command("lsp_clear_panel")
-            if auto_show_diagnostics_panel and is_active_panel:
-                window.run_command("hide_panel",
-                                   {"panel": "output.diagnostics"})
-        panel.set_read_only(True)
-
-
-def format_diagnostics(file_path, origin_diagnostics):
-    content = " ◌ {}:\n".format(file_path)
-    for origin, diagnostics in origin_diagnostics.items():
-        for diagnostic in diagnostics:
-            item = format_diagnostic(diagnostic)
-            content += item + "\n"
-    return content
 
 
 def start_client(window: sublime.Window, config: ClientConfig):
@@ -1594,29 +790,6 @@ def get_document_position(view: sublime.View, point) -> OrderedDict:
     d['textDocument'] = {"uri": filename_to_uri(view.file_name())}
     d['position'] = Point.from_text_point(view, point).to_lsp()
     return d
-
-
-class Events:
-    listener_dict = dict()  # type: Dict[str, Callable[..., None]]
-
-    @classmethod
-    def subscribe(cls, key, listener):
-        if key in cls.listener_dict:
-            cls.listener_dict[key].append(listener)
-        else:
-            cls.listener_dict[key] = [listener]
-        return lambda: cls.unsubscribe(key, listener)
-
-    @classmethod
-    def unsubscribe(cls, key, listener):
-        if key in cls.listener_dict:
-            cls.listener_dict[key].remove(listener)
-
-    @classmethod
-    def publish(cls, key, *args):
-        if key in cls.listener_dict:
-            for listener in cls.listener_dict[key]:
-                listener(*args)
 
 
 class HoverHandler(sublime_plugin.ViewEventListener):
@@ -1904,25 +1077,6 @@ class SignatureHelpListener(sublime_plugin.ViewEventListener):
                     max_width=800)
 
 
-def get_line_diagnostics(view, point):
-    row, _ = view.rowcol(point)
-    diagnostics = get_diagnostics_for_view(view)
-    return tuple(
-        diagnostic for diagnostic in diagnostics
-        if diagnostic.range.start.row <= row <= diagnostic.range.end.row
-    )
-
-
-def get_diagnostics_for_view(view: sublime.View) -> 'List[Diagnostic]':
-    window = view.window()
-    file_path = view.file_name()
-    origin = 'lsp'
-    if window.id() in window_file_diagnostics:
-        file_diagnostics = window_file_diagnostics[window.id()]
-        if file_path in file_diagnostics:
-            if origin in file_diagnostics[file_path]:
-                return file_diagnostics[file_path][origin]
-    return []
 
 
 class LspCodeActionsCommand(sublime_plugin.TextCommand):
